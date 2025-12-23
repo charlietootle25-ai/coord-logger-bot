@@ -1,35 +1,36 @@
 require('dotenv').config();
 const express = require('express');
+const fs = require('fs');
 const { Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, REST, Routes } = require('discord.js');
-const Database = require('better-sqlite3');
 
 // ============== CONFIG ==============
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const DISCORD_CHANNEL_ID = process.env.DISCORD_CHANNEL_ID;
 const PORT = process.env.PORT || 3000;
 
-// ============== DATABASE SETUP ==============
-const db = new Database('coordinates.db');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS coords (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    x INTEGER,
-    y INTEGER,
-    z INTEGER,
-    raw_description TEXT,
-    timestamp TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )
-`);
+// ============== JSON FILE DATABASE ==============
+const DB_FILE = './coordinates.json';
 
-// Prepared statements for better performance
-const insertCoord = db.prepare('INSERT INTO coords (x, y, z, raw_description, timestamp) VALUES (?, ?, ?, ?, ?)');
-const getAllCoords = db.prepare('SELECT * FROM coords ORDER BY created_at DESC LIMIT ?');
-const searchCoords = db.prepare('SELECT * FROM coords WHERE x BETWEEN ? AND ? AND z BETWEEN ? AND ? ORDER BY created_at DESC LIMIT 50');
-const getRecentCoords = db.prepare('SELECT * FROM coords ORDER BY created_at DESC LIMIT ?');
-const countCoords = db.prepare('SELECT COUNT(*) as count FROM coords');
-const deleteCoord = db.prepare('DELETE FROM coords WHERE id = ?');
-const clearAllCoords = db.prepare('DELETE FROM coords');
+function loadCoords() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+    }
+  } catch (e) {
+    console.error('Error loading coords:', e);
+  }
+  return [];
+}
+
+function saveCoords(coords) {
+  try {
+    fs.writeFileSync(DB_FILE, JSON.stringify(coords, null, 2));
+  } catch (e) {
+    console.error('Error saving coords:', e);
+  }
+}
+
+let coordinates = loadCoords();
 
 // ============== DISCORD BOT SETUP ==============
 const client = new Client({
@@ -71,7 +72,7 @@ const commands = [
   
   new SlashCommandBuilder()
     .setName('clearall')
-    .setDescription('Delete ALL coordinates (admin only)'),
+    .setDescription('Delete ALL coordinates'),
   
   new SlashCommandBuilder()
     .setName('export')
@@ -105,18 +106,18 @@ client.on('interactionCreate', async interaction => {
   try {
     if (commandName === 'coords') {
       const count = interaction.options.getInteger('count') || 10;
-      const coords = getRecentCoords.all(count);
+      const recentCoords = coordinates.slice(-count).reverse();
       
-      if (coords.length === 0) {
+      if (recentCoords.length === 0) {
         await interaction.reply({ content: '📭 No coordinates logged yet!', ephemeral: true });
         return;
       }
 
       const embed = new EmbedBuilder()
-        .setTitle(`📍 Recent Coordinates (${coords.length})`)
+        .setTitle(`📍 Recent Coordinates (${recentCoords.length})`)
         .setColor(0x7600FF)
-        .setDescription(coords.map(c => 
-          `**#${c.id}** \`${c.x}, ${c.y}, ${c.z}\` - <t:${Math.floor(new Date(c.created_at).getTime() / 1000)}:R>`
+        .setDescription(recentCoords.map(c => 
+          `**#${c.id}** \`${c.x}, ${c.y}, ${c.z}\` - <t:${Math.floor(new Date(c.timestamp).getTime() / 1000)}:R>`
         ).join('\n'))
         .setFooter({ text: 'Use /search to find coords near a location' });
 
@@ -128,9 +129,11 @@ client.on('interactionCreate', async interaction => {
       const z = interaction.options.getInteger('z');
       const radius = interaction.options.getInteger('radius') || 1000;
 
-      const coords = searchCoords.all(x - radius, x + radius, z - radius, z + radius);
+      const nearbyCoords = coordinates.filter(c => 
+        Math.abs(c.x - x) <= radius && Math.abs(c.z - z) <= radius
+      );
 
-      if (coords.length === 0) {
+      if (nearbyCoords.length === 0) {
         await interaction.reply({ 
           content: `📭 No coordinates found within ${radius} blocks of (${x}, ${z})`, 
           ephemeral: true 
@@ -139,7 +142,7 @@ client.on('interactionCreate', async interaction => {
       }
 
       // Sort by distance
-      const withDistance = coords.map(c => ({
+      const withDistance = nearbyCoords.map(c => ({
         ...c,
         distance: Math.sqrt(Math.pow(c.x - x, 2) + Math.pow(c.z - z, 2))
       })).sort((a, b) => a.distance - b.distance);
@@ -150,20 +153,19 @@ client.on('interactionCreate', async interaction => {
         .setDescription(withDistance.slice(0, 15).map(c => 
           `**#${c.id}** \`${c.x}, ${c.y}, ${c.z}\` - ${Math.round(c.distance)} blocks away`
         ).join('\n'))
-        .setFooter({ text: `Found ${coords.length} coords within ${radius} blocks` });
+        .setFooter({ text: `Found ${nearbyCoords.length} coords within ${radius} blocks` });
 
       await interaction.reply({ embeds: [embed] });
     }
 
     else if (commandName === 'stats') {
-      const total = countCoords.get().count;
-      const recent = getRecentCoords.all(1)[0];
+      const recent = coordinates[coordinates.length - 1];
 
       const embed = new EmbedBuilder()
         .setTitle('📊 Coordinate Stats')
         .setColor(0x00BFFF)
         .addFields(
-          { name: 'Total Logged', value: `${total} coordinates`, inline: true },
+          { name: 'Total Logged', value: `${coordinates.length} coordinates`, inline: true },
           { name: 'Last Coord', value: recent ? `\`${recent.x}, ${recent.y}, ${recent.z}\`` : 'None', inline: true }
         );
 
@@ -172,9 +174,11 @@ client.on('interactionCreate', async interaction => {
 
     else if (commandName === 'delete') {
       const id = interaction.options.getInteger('id');
-      const result = deleteCoord.run(id);
+      const index = coordinates.findIndex(c => c.id === id);
       
-      if (result.changes > 0) {
+      if (index !== -1) {
+        coordinates.splice(index, 1);
+        saveCoords(coordinates);
         await interaction.reply({ content: `✅ Deleted coordinate #${id}`, ephemeral: true });
       } else {
         await interaction.reply({ content: `❌ Coordinate #${id} not found`, ephemeral: true });
@@ -182,34 +186,22 @@ client.on('interactionCreate', async interaction => {
     }
 
     else if (commandName === 'clearall') {
-      // Add confirmation by requiring the command to be run twice within 10 seconds
-      await interaction.reply({ 
-        content: '⚠️ Are you sure? This will delete ALL coordinates!\nRun `/clearall` again within 10 seconds to confirm.',
-        ephemeral: true 
-      });
-      
-      // Simple confirmation (in production, use a button)
-      const filter = i => i.commandName === 'clearall' && i.user.id === interaction.user.id;
-      try {
-        clearAllCoords.run();
-        await interaction.followUp({ content: '🗑️ All coordinates have been deleted!', ephemeral: true });
-      } catch (e) {
-        // User didn't confirm
-      }
+      const count = coordinates.length;
+      coordinates = [];
+      saveCoords(coordinates);
+      await interaction.reply({ content: `🗑️ Deleted all ${count} coordinates!`, ephemeral: true });
     }
 
     else if (commandName === 'export') {
-      const coords = getAllCoords.all(1000);
-      
-      if (coords.length === 0) {
+      if (coordinates.length === 0) {
         await interaction.reply({ content: '📭 No coordinates to export!', ephemeral: true });
         return;
       }
 
-      const text = coords.map(c => `${c.x}, ${c.y}, ${c.z}`).join('\n');
+      const text = coordinates.slice(-50).map(c => `${c.x}, ${c.y}, ${c.z}`).join('\n');
       
       await interaction.reply({ 
-        content: `📋 **Exported ${coords.length} coordinates:**\n\`\`\`\n${text.slice(0, 1800)}\n\`\`\`${coords.length > 50 ? '\n(Showing first 50)' : ''}`,
+        content: `📋 **Exported ${Math.min(coordinates.length, 50)} coordinates:**\n\`\`\`\n${text}\n\`\`\`${coordinates.length > 50 ? '\n(Showing last 50)' : ''}`,
         ephemeral: true 
       });
     }
@@ -226,7 +218,7 @@ app.use(express.json());
 
 // Health check endpoint
 app.get('/', (req, res) => {
-  res.json({ status: 'online', coords_logged: countCoords.get().count });
+  res.json({ status: 'online', coords_logged: coordinates.length });
 });
 
 // Main webhook endpoint - receives data from Glazed
@@ -256,31 +248,41 @@ app.post('/webhook', async (req, res) => {
     const y = parseInt(coordMatch[2]);
     const z = parseInt(coordMatch[3]);
 
+    // Generate ID
+    const id = coordinates.length > 0 ? Math.max(...coordinates.map(c => c.id)) + 1 : 1;
+
     // Save to database
-    const result = insertCoord.run(x, y, z, description, timestamp);
-    console.log(`Saved coord #${result.lastInsertRowid}: ${x}, ${y}, ${z}`);
+    const newCoord = { id, x, y, z, timestamp, raw: description };
+    coordinates.push(newCoord);
+    saveCoords(coordinates);
+    
+    console.log(`Saved coord #${id}: ${x}, ${y}, ${z}`);
 
     // Forward to Discord channel
-    if (DISCORD_CHANNEL_ID) {
-      const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
-      if (channel) {
-        const discordEmbed = new EmbedBuilder()
-          .setTitle('📍 New Coordinate Logged')
-          .setDescription(`**Coords:** \`${x}, ${y}, ${z}\``)
-          .setColor(0x7600FF)
-          .addFields(
-            { name: 'X', value: `${x}`, inline: true },
-            { name: 'Y', value: `${y}`, inline: true },
-            { name: 'Z', value: `${z}`, inline: true }
-          )
-          .setFooter({ text: `ID: #${result.lastInsertRowid} • Sent by Glazed` })
-          .setTimestamp(new Date(timestamp));
+    if (DISCORD_CHANNEL_ID && client.isReady()) {
+      try {
+        const channel = await client.channels.fetch(DISCORD_CHANNEL_ID);
+        if (channel) {
+          const discordEmbed = new EmbedBuilder()
+            .setTitle('📍 New Coordinate Logged')
+            .setDescription(`**Coords:** \`${x}, ${y}, ${z}\``)
+            .setColor(0x7600FF)
+            .addFields(
+              { name: 'X', value: `${x}`, inline: true },
+              { name: 'Y', value: `${y}`, inline: true },
+              { name: 'Z', value: `${z}`, inline: true }
+            )
+            .setFooter({ text: `ID: #${id} • Sent by Glazed` })
+            .setTimestamp(new Date(timestamp));
 
-        await channel.send({ embeds: [discordEmbed] });
+          await channel.send({ embeds: [discordEmbed] });
+        }
+      } catch (discordError) {
+        console.error('Error sending to Discord:', discordError);
       }
     }
 
-    res.json({ success: true, id: result.lastInsertRowid, coords: { x, y, z } });
+    res.json({ success: true, id, coords: { x, y, z } });
 
   } catch (error) {
     console.error('Webhook error:', error);
